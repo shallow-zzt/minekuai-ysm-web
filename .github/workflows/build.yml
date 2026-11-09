@@ -1,0 +1,45 @@
+name: Build Web Application
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+      - name: Build frontend
+        working-directory: web
+        run: npm ci && npm run build
+      - name: Test backend
+        working-directory: backend
+        run: go test ./... && go vet ./...
+      - name: Build server binaries
+        working-directory: backend
+        run: |
+          mkdir -p ../dist
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o ../dist/ysm-bridge .
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -o ../dist/ysm-bridge.exe .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: minekuai-ysm-web
+          path: |
+            dist/
+            web/out/
+            config.example.json
+            start.cmd
+            start.ps1
+            README.md
+            LICENSE
