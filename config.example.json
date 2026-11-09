@@ -1,0 +1,7 @@
+{
+  "listen": "127.0.0.1:18081",
+  "sftp_address": "your-sftp-host:10001",
+  "sftp_user": "your-sftp-username",
+  "sftp_password": "your-sftp-password",
+  "remote_root": "/"
+}
