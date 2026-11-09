@@ -65,7 +65,7 @@ Windows 构建时，将 `go build` 命令中的输出路径改为 `../dist/ysm-b
 1. 复制 `config.example.json` 为 `config.json`，填写面板提供的 SFTP 地址、用户名、密码和根目录；与 Xftp / WinSCP 使用的连接信息一致。
 2. 从配套桥接仓库构建 JAR，上传至面板服 `mods` 目录，并重启游戏服务端一次。
 3. Windows 双击 `start.cmd` 并保持窗口打开；Linux 在仓库根目录先执行 `chmod +x dist/ysm-bridge`，再运行 `./dist/ysm-bridge -config config.json`。
-4. 打开 **http://127.0.0.1:18081**，确认模型列表可读取、重载桥在线后上传模型。
+4. 打开 [http://127.0.0.1:18081](http://127.0.0.1:18081)，确认模型列表可读取、重载桥在线后上传模型。
 
 仓库不包含预构建二进制、`web/out` 或个人配置。GitHub Actions 构建成功后，可从该次运行下载 `minekuai-ysm-web` 构建产物，保持其中 `dist/`、`web/out/` 与启动文件的目录关系。
 
