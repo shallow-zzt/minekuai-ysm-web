@@ -71,10 +71,10 @@ h1 > svg { color: #bc9edb; stroke-width: 1.2; }
 .breadcrumbs > svg { color: #aabed0; }
 .breadcrumbs button { background: none; display: flex; padding: 4px; color: #779bc2; }
 .breadcrumbs strong { font-weight: 500; color: #55799f; }
-.bridge-status { display: flex; align-items: center; gap: 7px; color: #7a8da7; font-size: 11px; }
-.bridge-status i { width: 6px; height: 6px; background: #9caac2; border-radius: 50%; box-shadow: 0 0 0 3px #dce5ef80; }
-.bridge-status.online { color: #628d94; }
-.bridge-status.online i { background: #74aaa9; box-shadow: 0 0 0 3px #d6ece680; }
+.panel-status { display: flex; align-items: center; gap: 7px; color: #7a8da7; font-size: 11px; }
+.panel-status i { width: 6px; height: 6px; background: #9caac2; border-radius: 50%; box-shadow: 0 0 0 3px #dce5ef80; }
+.panel-status.online { color: #628d94; }
+.panel-status.online i { background: #74aaa9; box-shadow: 0 0 0 3px #d6ece680; }
 .file-browser { overflow: hidden; }
 .browser-toolbar { display: flex; align-items: center; justify-content: space-between; padding: 23px 26px 21px; gap: 16px; }
 .browser-title { display: flex; align-items: center; gap: 10px; min-width: 0; }
@@ -152,6 +152,7 @@ input::placeholder { color: #91a7be; }
 .job > div { flex: 1; min-width: 0; }
 .job strong { font-size: 12px; font-weight: 500; }
 .job p { font-size: 11px; line-height: 1.7; margin: 5px 0; }
+.job .job-file { overflow-wrap: anywhere; }
 .job small { font-size: 9px; color: #8e9fba; overflow-wrap: anywhere; }
 .text-button { background: none; color: #7589b2; padding: 7px 0; display: flex; align-items: center; gap: 5px; font-size: 11px; white-space: nowrap; }
 .reload-panel { margin-top: 18px; padding: 22px; display: flex; align-items: center; justify-content: space-between; gap: 20px; }
@@ -241,7 +242,7 @@ form input { border: 1px solid var(--line); border-radius: 8px; padding: 11px 13
   .decoration-star { left: -29px; }
   .directory-bar { margin: 0 4px 14px; gap: 8px; }
   .breadcrumbs { gap: 8px; font-size: 10px; }
-  .bridge-status { font-size: 9px; gap: 6px; }
+  .panel-status { font-size: 9px; gap: 6px; }
   .browser-toolbar { padding: 18px 16px 17px; flex-wrap: wrap; gap: 15px; }
   .browser-title { gap: 8px; }
   .browser-title h2 { font-size: 13px; }

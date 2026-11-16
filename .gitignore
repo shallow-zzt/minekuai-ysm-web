@@ -1,17 +1,31 @@
+# Local configuration and secrets
 config.json
 config.*.local.json
 .env
 .env.*
 !.env.example
+APIKEY*.txt
+[Aa][Pp][Ii][Kk][Ee][Yy]*.txt
+secrets/
+*.key
+*.pem
+id_rsa
+id_ed25519
+
+# Runtime state, uploads and logs
+data/
+*.log
+
+# Dependencies and build output
 node_modules/
 .next/
 out/
 dist/
-data/
+.gradle/
+build/
 work/
-*.log
-*.key
-*.pem
 *.tsbuildinfo
+
+# Editor and OS state
 .DS_Store
 Thumbs.db

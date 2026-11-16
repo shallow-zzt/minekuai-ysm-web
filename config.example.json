@@ -3,5 +3,7 @@
   "sftp_address": "your-sftp-host:10001",
   "sftp_user": "your-sftp-username",
   "sftp_password": "your-sftp-password",
-  "remote_root": "/"
+  "remote_root": "/",
+  "minekuai_instance_id": "1234abcd",
+  "minekuai_api_key_file": "APIKEY.txt"
 }

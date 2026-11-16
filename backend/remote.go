@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -84,19 +83,6 @@ func (r *Remote) publish(stage, destination string, body io.Reader) error {
 	return r.Rename(stage, destination)
 }
 
-func (r *Remote) smallFile(name string) ([]byte, error) {
-	f, e := r.Open(name)
-	if e != nil {
-		return nil, e
-	}
-	defer f.Close()
-	b, e := io.ReadAll(io.LimitReader(f, 16385))
-	if len(b) > 16384 {
-		return nil, fmt.Errorf("oversized bridge record")
-	}
-	return b, e
-}
-
 type ModelFile struct {
 	Name     string    `json:"name"`
 	Size     int64     `json:"size"`
@@ -144,8 +130,4 @@ func (r *Remote) models(root string) ([]ModelFile, int64, error) {
 	}
 	e := walk(root, 0)
 	return files, total, e
-}
-
-func (r *Remote) request(root, id string) error {
-	return r.publish(path.Join(root, "staging", id+".req.part"), path.Join(root, "requests", id+".req"), bytes.NewBufferString("reload\n"))
 }

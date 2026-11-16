@@ -4,8 +4,18 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 type Access = { upload_required: boolean; reload_required: boolean };
 type Model = { name: string; size: number; modified: string };
-type Library = { files: Model[]; total_bytes: number; max_upload_bytes: number; max_library_bytes: number; heartbeat: { time: string } | null };
-type Job = { id: string; status: string; message: string; file?: string };
+type Library = { files: Model[]; total_bytes: number; max_upload_bytes: number; max_library_bytes: number };
+type Panel = { state: "running" | "offline" | "starting" | "stopping" | "suspended" | "unknown" | "error"; message: string };
+type Job = { id?: string; status: "submitted" | "failed" | "unknown" | "pending" | "uploaded"; message: string; file?: string };
+const panelLabels: Record<Panel["state"], string> = { running: "服务器运行中", offline: "服务器未启动", starting: "服务器启动中", stopping: "服务器停止中", suspended: "服务器已暂停", unknown: "服务器状态待确认", error: "面板连接异常" };
+const jobLabels: Record<Job["status"], string> = { submitted: "重载指令已提交", failed: "重载指令提交失败", unknown: "重载提交结果待确认", pending: "重载请求需要处理", uploaded: "模型已上传，尚未提交重载" };
+const jobGuidance: Record<Job["status"], string> = {
+  submitted: "面板已接受指令。模型是否加载与同步完成，请在游戏中确认。",
+  failed: "请检查面板连接与服务器状态，恢复后手动申请重载。",
+  unknown: "请先在面板控制台核对指令是否已收到，再决定是否重新提交，避免重复重载。",
+  pending: "这次请求的提交过程曾中断，不会自动重试。请先检查面板控制台，确认后手动申请重载。",
+  uploaded: "文件已保存，但未能保存重载请求，因此没有发送指令。请联系服主检查后手动申请重载。",
+};
 const sizeLabel = (n: number) => n < 1048576 ? `${Math.round(n / 1024)} KB` : `${(n / 1048576).toFixed(1)} MB`;
 const cleanName = (n: string) => n.replace(/^[a-f0-9]{32}_/, "");
 
@@ -36,9 +46,9 @@ export default function Home() {
   const [token, setToken] = useState("");
   const [draftToken, setDraftToken] = useState("");
   const [library, setLibrary] = useState<Library | null>(null);
+  const [panel, setPanel] = useState<Panel | null>(null);
   const [file, setFile] = useState<File | null>(null);
   const [error, setError] = useState("");
-  const [notice, setNotice] = useState("");
   const [progress, setProgress] = useState(0);
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -48,6 +58,7 @@ export default function Home() {
   const [sort, setSort] = useState<"name" | "size" | "modified">("modified");
   const [ascending, setAscending] = useState(false);
   const [job, setJob] = useState<Job | null>(null);
+  const [checkingJob, setCheckingJob] = useState(false);
   const [adminOpen, setAdminOpen] = useState(false);
   const [adminToken, setAdminToken] = useState("");
   const [reloadBusy, setReloadBusy] = useState(false);
@@ -63,12 +74,18 @@ export default function Home() {
     return body;
   }, [token]);
 
+  const refreshPanel = useCallback(async () => {
+    try { setPanel(await api("/api/panel")); }
+    catch (e) { setPanel({ state: "error", message: (e as Error).message }); }
+  }, [api]);
+
   const refresh = useCallback(async () => {
     setLoading(true);
+    void refreshPanel();
     try { setLibrary(await api("/api/models")); setError(""); }
     catch (e) { setError((e as Error).message); }
     finally { setLoading(false); }
-  }, [api]);
+  }, [api, refreshPanel]);
 
   useEffect(() => { const saved = sessionStorage.getItem("ysm-token"); if (saved) setToken(saved); }, []);
   useEffect(() => {
@@ -80,28 +97,9 @@ export default function Home() {
     return () => controller.abort();
   }, []);
   useEffect(() => { if (ready) void refresh(); }, [ready, refresh]);
-  useEffect(() => {
-    if (!ready || !job || !["pending", "unknown"].includes(job.status)) return;
-    let active = true;
-    let attempts = 0;
-    let timer: ReturnType<typeof setTimeout>;
-    const poll = async () => {
-      try {
-        const updated: Job = await api(`/api/jobs/${job.id}`);
-        if (!active) return;
-        setJob(updated);
-        if (!["pending", "unknown"].includes(updated.status)) { void refresh(); return; }
-      } catch (e) { if (active) setError((e as Error).message); }
-      if (active && ++attempts < 60) timer = setTimeout(poll, 5000);
-      else if (active) setNotice("已等待 5 分钟。服务器上线后仍可处理请求，可点击检查回执再次查看。");
-    };
-    timer = setTimeout(poll, 5000);
-    return () => { active = false; clearTimeout(timer); };
-  }, [job?.id, ready, api, refresh]); // One bounded polling loop per request.
-
   function choose(selected: File | undefined) {
     if (!selected) return;
-    setNotice(""); setError(""); setFile(null);
+    setError(""); setFile(null);
     if (!/\.(ysm|zip)$/i.test(selected.name)) { setError("请选择 .ysm 或 .zip 模型包"); return; }
     if (selected.size > (library?.max_upload_bytes || 64 * 1048576)) { setError("这个文件超出了上传大小限制"); return; }
     setFile(selected); setProgress(0);
@@ -109,7 +107,7 @@ export default function Home() {
 
   async function upload() {
     if (!file || !ready || busy) return;
-    setBusy(true); setError(""); setNotice(""); setProgress(0);
+    setBusy(true); setError(""); setProgress(0);
     const form = new FormData(); form.append("file", file);
     try {
       const result = await new Promise<Job>((resolve, reject) => {
@@ -117,11 +115,11 @@ export default function Home() {
         xhr.open("POST", "/api/models"); xhr.timeout = 240000;
         if (token) xhr.setRequestHeader("Authorization", `Bearer ${token}`);
         xhr.upload.onprogress = e => { if (e.lengthComputable) setProgress(Math.round(e.loaded / e.total * 100)); };
-        xhr.onerror = () => reject(new Error("连接中断，请刷新模型列表核实上传结果"));
-        xhr.ontimeout = () => reject(new Error("上传超时，请刷新模型列表核实上传结果"));
+        xhr.onerror = () => reject(new Error("连接中断，请刷新模型列表，并在面板控制台核实重载是否已收到后再重试"));
+        xhr.ontimeout = () => reject(new Error("上传超时，请刷新模型列表，并在面板控制台核实重载是否已收到后再重试"));
         xhr.onload = () => {
           try { const body = JSON.parse(xhr.responseText); if (xhr.status >= 200 && xhr.status < 300) resolve(body); else reject(new Error(body.error || "上传失败")); }
-          catch { reject(new Error("服务器返回异常，请稍后重试")); }
+          catch { reject(new Error("服务器响应异常。请先刷新模型列表并检查面板控制台，确认上传与重载结果后再重试。")); }
         };
         xhr.send(form);
       });
@@ -133,12 +131,20 @@ export default function Home() {
   }
 
   async function reload() {
+    if (reloadBusy) return;
     setReloadBusy(true); setError("");
-    try { setJob(await api("/api/reload", { method: "POST" }, adminToken || token)); setAdminToken(""); setAdminOpen(false); }
-    catch (e) { setError((e as Error).message); }
+    try { setJob(await api("/api/reload", { method: "POST" }, adminToken || token)); setAdminToken(""); setAdminOpen(false); void refreshPanel(); }
+    catch (e) { setError(e instanceof TypeError || e instanceof SyntaxError ? "重载提交结果暂时无法确认。请先在面板控制台核对指令是否已收到，再决定是否重新提交。" : (e as Error).message); }
     finally { setReloadBusy(false); }
   }
 
+  async function checkJob() {
+    if (!job?.id || checkingJob) return;
+    setCheckingJob(true); setError("");
+    try { setJob(await api(`/api/jobs/${job.id}`)); }
+    catch (e) { setError((e as Error).message); }
+    finally { setCheckingJob(false); }
+  }
 
   function openUpload() {
     if (!uploadDialog.current?.open) uploadDialog.current?.showModal();
@@ -149,8 +155,6 @@ export default function Home() {
     setSort(column);
   }
 
-  const heartbeatAge = library?.heartbeat ? Date.now() - Date.parse(library.heartbeat.time) : Infinity;
-  const online = Number.isFinite(heartbeatAge) && heartbeatAge < 30000;
   const allModels = library?.files || [];
   const models = allModels.filter(model =>
     cleanName(model.name).toLowerCase().includes(search.toLowerCase()) &&
@@ -199,7 +203,7 @@ export default function Home() {
         </section> : <>
           <div className="directory-bar">
             <nav className="breadcrumbs" aria-label="模型目录"><button aria-label="显示全部模型" onClick={() => { setSearch(""); setFileType("all"); }}><Icon kind="home" size={17} /></button><Icon kind="chevron" size={13} /><span>服务器</span><Icon kind="chevron" size={13} /><strong>模型衣橱</strong></nav>
-            <span className={`bridge-status ${online ? "online" : ""}`}><i />{online ? "重载桥在线" : "等待重载桥连接"}</span>
+            <span className={`panel-status ${panel?.state === "running" ? "online" : ""}`} title={panel?.message} role="status"><i />{panel ? panelLabels[panel.state] : "正在连接面板"}</span>
           </div>
 
           <section className="file-browser surface" aria-label="服务器模型文件">
@@ -250,17 +254,21 @@ export default function Home() {
 
       <div className="notifications" aria-live="polite">
         {error && <div className="message error"><Icon kind="info" size={19} /><span>{error}</span></div>}
-        {notice && <div className="message"><Icon kind="info" size={19} /><span>{notice}</span></div>}
-        {job && <div className={`message job ${job.status === "failed" ? "error" : ""}`}><span className="job-icon"><Icon kind={job.status === "dispatched" ? "check" : "refresh"} /></span><div><strong>{job.status === "dispatched" ? "重载命令已执行" : job.status === "pending" ? "模型正在等待重载" : "上传状态"}</strong><p>{job.message}</p><small>请求 {job.id}</small></div><button className="text-button" onClick={async () => { try { setJob(await api(`/api/jobs/${job.id}`)); } catch (e) { setError((e as Error).message); } }}>检查回执<Icon kind="chevron" size={13} /></button></div>}
+        {ready && panel && panel.state !== "running" && panel.message && <div className={`message ${panel.state === "error" ? "error" : ""}`}><Icon kind="info" size={19} /><span>{panel.message}</span></div>}
+        {job && <div className={`message job ${job.status === "failed" ? "error" : ""}`}>
+          <span className="job-icon"><Icon kind={job.status === "submitted" ? "check" : "info"} /></span>
+          <div><strong>{jobLabels[job.status] || "操作状态"}</strong><p>{job.message}</p><p>{jobGuidance[job.status]}</p>{job.file && <p className="job-file">已保存：{cleanName(job.file)}{job.status !== "submitted" && "，无需重复上传。"}</p>}{job.id && <small>请求 {job.id}</small>}</div>
+          {job.id && job.status !== "uploaded" && <button className="text-button" disabled={checkingJob} onClick={checkJob}>{checkingJob ? "正在读取…" : "查看提交记录"}<Icon kind="chevron" size={13} /></button>}
+        </div>}
       </div>
 
-      {adminOpen && <section className="reload-panel surface"><div><h3>申请服务器重载</h3><p>手动添加模型或重试时，发送一次重载请求。</p></div><form onSubmit={event => { event.preventDefault(); void reload(); }}>{access?.reload_required && <input aria-label="管理员口令" type="password" value={adminToken} onChange={event => setAdminToken(event.target.value)} placeholder="输入管理员口令" required autoComplete="off" />}<button className="primary" disabled={reloadBusy}>{reloadBusy ? "正在提交…" : "提交重载"}</button><button className="icon-button" type="button" aria-label="关闭重载面板" onClick={() => setAdminOpen(false)}><Icon kind="close" size={18} /></button></form></section>}
+      {adminOpen && <section className="reload-panel surface"><div><h3>申请服务器重载</h3><p>通过麦块面板提交模型重载指令，之后请在游戏中确认结果。</p></div><form onSubmit={event => { event.preventDefault(); void reload(); }}>{access?.reload_required && <input aria-label="管理员口令" type="password" value={adminToken} onChange={event => setAdminToken(event.target.value)} placeholder="输入管理员口令" required autoComplete="off" />}<button className="primary" disabled={reloadBusy}>{reloadBusy ? "正在提交…" : "提交重载"}</button><button className="icon-button" type="button" aria-label="关闭重载面板" onClick={() => setAdminOpen(false)}><Icon kind="close" size={18} /></button></form></section>}
 
-      <section className="guide" aria-label="使用流程"><div><span>01</span><strong>上传模型</strong><p>选择完整的 YSM 模型包</p></div><i /><div><span>02</span><strong>等待重载</strong><p>通常在 5–35 秒内执行</p></div><i /><div><span>03</span><strong>游戏中见</strong><p>等待同步后，选择你的新模型</p></div></section>
+      <section className="guide" aria-label="使用流程"><div><span>01</span><strong>上传模型</strong><p>选择完整的 YSM 模型包</p></div><i /><div><span>02</span><strong>提交重载</strong><p>自动通过麦块面板发送指令</p></div><i /><div><span>03</span><strong>游戏中见</strong><p>等待同步后，选择你的新模型</p></div></section>
       <p className="usage-note"><Icon kind="info" size={14} />模型将向全服玩家开放。YSM 加载与同步需要一些时间，可在游戏中确认结果。</p>
     </main>
 
-    <footer className="site-footer"><span><Icon kind="sparkle" size={14} />每一种模样，都值得被收藏。</span><div><span>衣橱 · Yes Steve Model</span>{access?.upload_required && token && <button onClick={() => { sessionStorage.removeItem("ysm-token"); setToken(""); setLibrary(null); setJob(null); setError(""); setAdminOpen(false); }}>退出衣橱</button>}</div></footer>
+    <footer className="site-footer"><span><Icon kind="sparkle" size={14} />每一种模样，都值得被收藏。</span><div><span>衣橱 · Yes Steve Model</span>{access?.upload_required && token && <button onClick={() => { sessionStorage.removeItem("ysm-token"); setToken(""); setLibrary(null); setPanel(null); setJob(null); setError(""); setAdminOpen(false); setAdminToken(""); }}>退出衣橱</button>}</div></footer>
 
     <dialog className="upload-dialog surface" ref={uploadDialog} aria-labelledby="upload-title" onCancel={event => { if (busy) event.preventDefault(); }}>
       <div className="dialog-heading"><span className="dialog-icon"><Icon kind="upload" size={23} /></span><div><h2 id="upload-title">添加一份新模样</h2><p>上传到服务器衣橱</p></div><button className="icon-button" aria-label="关闭上传窗口" disabled={busy} onClick={() => uploadDialog.current?.close()}><Icon kind="close" size={20} /></button></div>
@@ -270,7 +278,7 @@ export default function Home() {
       <input ref={input} type="file" accept=".ysm,.zip" className="sr-only" tabIndex={-1} onChange={event => choose(event.target.files?.[0])} disabled={busy} />
       {error && <p className="dialog-error" role="alert">{error}</p>}
       {busy && <div className="upload-progress"><progress value={progress} max="100" aria-label="上传进度" /><span>{progress < 100 ? `已上传 ${progress}%` : "正在传送到服务器…"}</span></div>}
-      <p className="dialog-note">上传你有权使用的模型。文件传送完成后，会自动申请服务器重载。</p>
+      <p className="dialog-note">上传你有权使用的模型。文件传送完成后，会自动向麦块面板提交重载指令，请在游戏中确认新模型。</p>
       <div className="dialog-actions"><button className="secondary" disabled={busy} onClick={() => uploadDialog.current?.close()}>取消</button><button className="primary" disabled={!file || busy || !library} onClick={upload}>{busy ? "正在上传…" : "上传到服务器"}<Icon kind="arrow" size={18} /></button></div>
     </dialog>
   </div>;

@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
@@ -70,7 +71,7 @@ func testApp(t *testing.T) *App {
 			}()
 		}
 	}()
-	return &App{config: Config{SFTPAddress: listener.Addr().String(), SFTPUser: "test", SFTPPassword: "test", HostKeySHA256: ssh.FingerprintSHA256(signer.PublicKey()), RemoteRoot: "/", MaxUploadMB: 1, MaxLibraryMB: 1, UploadToken: strings.Repeat("p", 24), AdminToken: strings.Repeat("a", 24)}, slots: make(chan struct{}, 4)}
+	return &App{panel: &fakePanel{}, config: Config{jobDir: t.TempDir(), SFTPAddress: listener.Addr().String(), SFTPUser: "test", SFTPPassword: "test", HostKeySHA256: ssh.FingerprintSHA256(signer.PublicKey()), RemoteRoot: "/", MaxUploadMB: 1, MaxLibraryMB: 1, UploadToken: strings.Repeat("p", 24), AdminToken: strings.Repeat("a", 24)}, slots: make(chan struct{}, 4)}
 }
 func sendUpload(a *App, name string, data []byte) *httptest.ResponseRecorder {
 	var body bytes.Buffer
@@ -85,47 +86,149 @@ func sendUpload(a *App, name string, data []byte) *httptest.ResponseRecorder {
 	a.handler().ServeHTTP(response, req)
 	return response
 }
-func TestUploadQueueAndAck(t *testing.T) {
+
+type fakePanel struct {
+	err    error
+	calls  int
+	before func()
+}
+
+func (p *fakePanel) Reload(context.Context) error {
+	p.calls++
+	if p.before != nil {
+		p.before()
+	}
+	return p.err
+}
+func (p *fakePanel) Status(context.Context) (PanelStatus, error) {
+	return PanelStatus{State: "running", Message: "test"}, p.err
+}
+
+func TestUploadPublishesBeforeAPIAndPersistsResult(t *testing.T) {
 	a := testApp(t)
 	data := bytes.Repeat([]byte("ysm-test"), 32)
-	response := sendUpload(a, "测试模型.ysm", data)
+	panel := a.panel.(*fakePanel)
+	panel.before = func() {
+		remote, err := connect(context.Background(), a.config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer remote.Close()
+		models, uploads := a.roots()
+		files, _, err := remote.models(models)
+		if err != nil || len(files) != 1 {
+			t.Fatalf("must publish before command: %v %v", files, err)
+		}
+		f, err := remote.Open(path.Join(models, files[0].Name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, _ := io.ReadAll(f)
+		f.Close()
+		if !bytes.Equal(got, data) {
+			t.Fatal("upload changed")
+		}
+		entries, err := remote.ReadDir(path.Join(uploads, "staging"))
+		if err != nil || len(entries) != 0 {
+			t.Fatal("staging not empty")
+		}
+		if _, err = remote.Stat("/config/ysm_upload_bridge"); !os.IsNotExist(err) {
+			t.Fatal("created bridge directory")
+		}
+	}
+	response := sendUpload(a, "test.ysm", data)
 	if response.Code != 201 {
 		t.Fatalf("%d %s", response.Code, response.Body.String())
 	}
-	var job map[string]string
-	json.Unmarshal(response.Body.Bytes(), &job)
-	r, e := connect(context.Background(), a.config)
-	if e != nil {
-		t.Fatal(e)
+	var job Job
+	if err := json.Unmarshal(response.Body.Bytes(), &job); err != nil {
+		t.Fatal(err)
 	}
-	defer r.Close()
-	models, bridge := a.roots()
-	f, e := r.Open(path.Join(models, job["file"]))
-	if e != nil {
-		t.Fatal(e)
+	if job.Status != "submitted" || panel.calls != 1 || job.File == "" {
+		t.Fatalf("invalid result: %+v", job)
 	}
-	got, _ := io.ReadAll(f)
-	f.Close()
-	if !bytes.Equal(got, data) {
-		t.Fatal("uploaded bytes changed")
-	}
-	if _, e = r.Stat(path.Join(bridge, "requests", job["id"]+".req")); e != nil {
-		t.Fatal(e)
-	}
-	entries, e := r.ReadDir(path.Join(bridge, "staging"))
-	if e != nil || len(entries) != 0 {
-		t.Fatal("staging not empty")
-	}
-	ack := []byte(`{"status":"dispatched","message":"test"}`)
-	if e = r.publish(path.Join(bridge, "staging", "ack.tmp"), path.Join(bridge, "acks", job["id"]+".json"), bytes.NewReader(ack)); e != nil {
-		t.Fatal(e)
-	}
-	req := httptest.NewRequest("GET", "/api/jobs/"+job["id"], nil)
-	req.Header.Set("Authorization", "Bearer "+a.config.UploadToken)
+	// A new application instance reads the result with no SFTP/panel dependency.
+	restarted := &App{config: Config{jobDir: a.config.jobDir}, slots: make(chan struct{}, 4)}
+	request := httptest.NewRequest("GET", "/api/jobs/"+job.ID, nil)
 	out := httptest.NewRecorder()
-	a.handler().ServeHTTP(out, req)
-	if out.Code != 200 || !strings.Contains(out.Body.String(), "dispatched") {
+	restarted.handler().ServeHTTP(out, request)
+	if out.Code != 200 || !strings.Contains(out.Body.String(), "submitted") {
 		t.Fatal(out.Body.String())
+	}
+}
+func TestReloadFailureKeepsUploadAndDoesNotReplay(t *testing.T) {
+	for _, unknown := range []bool{false, true} {
+		t.Run(fmt.Sprint(unknown), func(t *testing.T) {
+			a := testApp(t)
+			panel := a.panel.(*fakePanel)
+			panel.err = &PanelError{Unknown: unknown, Message: "test failure"}
+			response := sendUpload(a, "kept.ysm", bytes.Repeat([]byte("x"), 32))
+			var job Job
+			json.Unmarshal(response.Body.Bytes(), &job)
+			want := "failed"
+			if unknown {
+				want = "unknown"
+			}
+			if job.Status != want || response.Code != 201 {
+				t.Fatalf("%d %+v", response.Code, job)
+			}
+			remote, err := connect(context.Background(), a.config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer remote.Close()
+			models, _ := a.roots()
+			if _, err = remote.Stat(path.Join(models, job.File)); err != nil {
+				t.Fatal("lost published model", err)
+			}
+			for range 3 {
+				j, err := a.readJob(job.ID)
+				if err != nil || j.Status != want {
+					t.Fatal(j, err)
+				}
+			}
+			if panel.calls != 1 {
+				t.Fatal("unexpected retry")
+			}
+		})
+	}
+}
+func TestManualReloadIndependentOfSFTPAndCooldown(t *testing.T) {
+	a := testApp(t)
+	a.config.SFTPAddress = "invalid:1"
+	job := a.submitReload("")
+	if job.Status != "submitted" {
+		t.Fatal(job)
+	}
+	job = a.submitReload("")
+	if job.Status != "failed" || a.panel.(*fakePanel).calls != 1 {
+		t.Fatal("cooldown failed", job)
+	}
+	a.lastReload = time.Now().Add(-11 * time.Second)
+	if a.submitReload("").Status != "submitted" {
+		t.Fatal("cooldown did not expire")
+	}
+}
+func TestJobPersistenceFailureDoesNotSend(t *testing.T) {
+	a := testApp(t)
+	file := path.Join(t.TempDir(), "not-directory")
+	os.WriteFile(file, []byte("x"), 0600)
+	a.config.jobDir = file
+	job := a.submitReload("already-saved.ysm")
+	if job.Status != "uploaded" || a.panel.(*fakePanel).calls != 0 {
+		t.Fatal(job)
+	}
+}
+func TestInterruptedJobIsNeverReplayed(t *testing.T) {
+	a := testApp(t)
+	j := Job{ID: newID(), Status: "pending", Message: "interrupted"}
+	if err := a.writeJob(j, false); err != nil {
+		t.Fatal(err)
+	}
+	restarted := &App{config: a.config, panel: &fakePanel{}}
+	record, err := restarted.readJob(j.ID)
+	if err != nil || record.Status != "pending" || restarted.panel.(*fakePanel).calls != 0 {
+		t.Fatal(record, err)
 	}
 }
 func TestAuthFingerprintAndConcurrentQuota(t *testing.T) {
@@ -194,7 +297,7 @@ func TestZipValidation(t *testing.T) {
 	}
 }
 
-func TestStaticHealthAndPendingJob(t *testing.T) {
+func TestStaticHealthAndRecordedJob(t *testing.T) {
 	a := testApp(t)
 	a.config.WebDir = t.TempDir()
 	if err := os.WriteFile(path.Join(a.config.WebDir, "index.html"), []byte("wardrobe-page"), 0600); err != nil {
@@ -217,7 +320,7 @@ func TestStaticHealthAndPendingJob(t *testing.T) {
 	request.Header.Set("Authorization", "Bearer "+a.config.UploadToken)
 	result := httptest.NewRecorder()
 	a.handler().ServeHTTP(result, request)
-	if result.Code != 200 || !strings.Contains(result.Body.String(), "pending") {
+	if result.Code != 200 || !strings.Contains(result.Body.String(), "submitted") {
 		t.Fatal(result.Body.String())
 	}
 	rejected := sendUpload(a, "too-big.ysm", bytes.Repeat([]byte("x"), (1<<20)+1))

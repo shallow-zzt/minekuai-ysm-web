@@ -106,8 +106,10 @@ func TestMinimalConfigAndPublicUpload(t *testing.T) {
 	t.Setenv("YSM_UPLOAD_TOKEN", "")
 	t.Setenv("YSM_ADMIN_TOKEN", "")
 	t.Setenv("YSM_SFTP_PASSWORD", "")
+	t.Setenv("YSM_MINEKUAI_API_KEY", "")
+	t.Setenv("YSM_MINEKUAI_INSTANCE_ID", "")
 	filename := filepath.Join(t.TempDir(), "config.json")
-	if err := os.WriteFile(filename, []byte(`{"sftp_address":"example.test:22","sftp_user":"test","sftp_password":"test"}`), 0600); err != nil {
+	if err := os.WriteFile(filename, []byte(`{"sftp_address":"example.test:22","sftp_user":"test","sftp_password":"test","minekuai_instance_id":"1234abcd","minekuai_api_key":"mkc_test.with-separator"}`), 0600); err != nil {
 		t.Fatal(err)
 	}
 	config, err := loadConfig(filename)

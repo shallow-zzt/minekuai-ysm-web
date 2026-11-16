@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -21,10 +22,21 @@ import (
 	"time"
 )
 
+type Panel interface {
+	Status(context.Context) (PanelStatus, error)
+	Reload(context.Context) error
+}
+
 type App struct {
-	config Config
-	writes sync.Mutex
-	slots  chan struct{}
+	config       Config
+	writes       sync.Mutex
+	slots        chan struct{}
+	panel        Panel
+	reloadMu     sync.Mutex
+	lastReload   time.Time
+	panelMu      sync.Mutex
+	panelChecked time.Time
+	panelCached  PanelStatus
 }
 
 var jobID = regexp.MustCompile(`^[a-f0-9]{32}$`)
@@ -83,10 +95,10 @@ func (a *App) remote(w http.ResponseWriter, r *http.Request) (*Remote, bool) {
 	return remote, true
 }
 func (a *App) roots() (string, string) {
-	return path.Join(a.config.RemoteRoot, "config/yes_steve_model/custom"), path.Join(a.config.RemoteRoot, "config/ysm_upload_bridge")
+	return path.Join(a.config.RemoteRoot, "config/yes_steve_model/custom"), path.Join(a.config.RemoteRoot, "config/ysm_web_uploads")
 }
-func prepare(remote *Remote, models, bridge string) error {
-	for _, p := range []string{models, path.Join(bridge, "staging"), path.Join(bridge, "requests"), path.Join(bridge, "acks")} {
+func prepare(remote *Remote, models, uploads string) error {
+	for _, p := range []string{models, path.Join(uploads, "staging")} {
 		if e := remote.MkdirAll(p); e != nil {
 			return e
 		}
@@ -99,7 +111,7 @@ func (a *App) list(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer remote.Close()
-	models, bridge := a.roots()
+	models, _ := a.roots()
 	files, total, e := remote.models(models)
 	if os.IsNotExist(e) {
 		files = []ModelFile{}
@@ -111,11 +123,7 @@ func (a *App) list(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sort.Slice(files, func(i, j int) bool { return files[i].Modified.After(files[j].Modified) })
-	var heartbeat any
-	if b, e := remote.smallFile(path.Join(bridge, "heartbeat.json")); e == nil {
-		json.Unmarshal(b, &heartbeat)
-	}
-	jsonResponse(w, 200, map[string]any{"files": files, "total_bytes": total, "max_upload_bytes": a.config.MaxUploadMB << 20, "max_library_bytes": a.config.MaxLibraryMB << 20, "heartbeat": heartbeat})
+	jsonResponse(w, 200, map[string]any{"files": files, "total_bytes": total, "max_upload_bytes": a.config.MaxUploadMB << 20, "max_library_bytes": a.config.MaxLibraryMB << 20})
 }
 func (a *App) upload(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, (a.config.MaxUploadMB<<20)+(1<<20))
@@ -165,8 +173,8 @@ func (a *App) upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer remote.Close()
-	models, bridge := a.roots()
-	if e = prepare(remote, models, bridge); e != nil {
+	models, uploads := a.roots()
+	if e = prepare(remote, models, uploads); e != nil {
 		log.Printf("prepare: %v", e)
 		fail(w, 502, "创建远端目录失败，请检查权限")
 		return
@@ -182,19 +190,14 @@ func (a *App) upload(w http.ResponseWriter, r *http.Request) {
 	}
 	id := newID()
 	remoteName := id + "_" + name
-	if e = remote.publish(path.Join(bridge, "staging", id+".upload.part"), path.Join(models, remoteName), temp); e != nil {
+	if e = remote.publish(path.Join(uploads, "staging", id+".upload.part"), path.Join(models, remoteName), temp); e != nil {
 		log.Printf("publish %s: %v", id, e)
 		fail(w, 502, "模型发布失败，请刷新文件列表核实后重试")
 		return
 	}
-	status := "pending"
-	message := "文件已上传，等待服务器执行重载"
-	if e = remote.request(bridge, id); e != nil {
-		log.Printf("queue %s: %v", id, e)
-		status = "uploaded"
-		message = "文件已上传，但重载请求写入失败，请联系管理员手动重载"
-	}
-	jsonResponse(w, 201, map[string]any{"id": id, "file": remoteName, "status": status, "message": message})
+	// Finish submission even if the browser disconnects after the file is committed.
+	job := a.submitReload(remoteName)
+	jsonResponse(w, 201, job)
 }
 func (a *App) job(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
@@ -202,52 +205,32 @@ func (a *App) job(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, "请求编号无效")
 		return
 	}
-	remote, ok := a.remote(w, r)
-	if !ok {
+	record, err := a.readJob(id)
+	if os.IsNotExist(err) {
+		fail(w, 404, "未找到这次重载记录")
 		return
 	}
-	defer remote.Close()
-	_, bridge := a.roots()
-	b, e := remote.smallFile(path.Join(bridge, "acks", id+".json"))
-	if e == nil {
-		var ack any
-		if json.Unmarshal(b, &ack) != nil {
-			fail(w, 502, "重载回执损坏")
-			return
-		}
-		jsonResponse(w, 200, ack)
+	if err != nil {
+		fail(w, 500, "读取本地重载记录失败")
 		return
 	}
-	if !os.IsNotExist(e) {
-		fail(w, 502, "无法读取重载回执")
-		return
-	}
-	if _, e = remote.Stat(path.Join(bridge, "requests", id+".req")); e == nil {
-		jsonResponse(w, 200, map[string]string{"id": id, "status": "pending", "message": "等待服务器执行重载"})
-		return
-	}
-	// The mod may have written an ACK between the two reads; a later poll resolves this state.
-	jsonResponse(w, 200, map[string]string{"id": id, "status": "unknown", "message": "暂未找到请求或回执，请稍后刷新"})
+	jsonResponse(w, 200, record)
 }
 func (a *App) reload(w http.ResponseWriter, r *http.Request) {
-	a.writes.Lock()
-	defer a.writes.Unlock()
-	remote, ok := a.remote(w, r)
-	if !ok {
-		return
+	// Reload needs only the panel API; SFTP availability does not block it.
+	jsonResponse(w, 202, a.submitReload(""))
+}
+func (a *App) panelStatus(w http.ResponseWriter, r *http.Request) {
+	a.panelMu.Lock()
+	defer a.panelMu.Unlock()
+	if time.Since(a.panelChecked) >= 10*time.Second {
+		state, err := a.panel.Status(r.Context())
+		if err != nil {
+			state = PanelStatus{State: "error", Message: err.Error()}
+		}
+		a.panelCached, a.panelChecked = state, time.Now()
 	}
-	defer remote.Close()
-	models, bridge := a.roots()
-	if e := prepare(remote, models, bridge); e != nil {
-		fail(w, 502, "创建重载目录失败")
-		return
-	}
-	id := newID()
-	if e := remote.request(bridge, id); e != nil {
-		fail(w, 502, "写入重载请求失败")
-		return
-	}
-	jsonResponse(w, 202, map[string]string{"id": id, "status": "pending", "message": "重载请求已排队"})
+	jsonResponse(w, 200, a.panelCached)
 }
 func (a *App) handler() http.Handler {
 	mux := http.NewServeMux()
@@ -256,6 +239,7 @@ func (a *App) handler() http.Handler {
 		w.Header().Set("Cache-Control", "no-store")
 		jsonResponse(w, 200, map[string]bool{"upload_required": a.config.UploadToken != "", "reload_required": a.config.AdminToken != "" || a.config.UploadToken != ""})
 	})
+	mux.HandleFunc("GET /api/panel", a.authorize(a.panelStatus, false))
 	mux.HandleFunc("GET /api/models", a.authorize(a.list, false))
 	mux.HandleFunc("POST /api/models", a.authorize(a.upload, false))
 	mux.HandleFunc("GET /api/jobs/{id}", a.authorize(a.job, false))
@@ -286,18 +270,21 @@ func main() {
 	}
 	defer logFile.Close()
 	log.SetOutput(io.MultiWriter(os.Stderr, logFile))
-	log.Printf("Starting YSM Bridge. Log file: %s", logPath)
+	log.Printf("Starting YSM Upload (Minekuai API). Log file: %s", logPath)
 	c, e := loadConfig(*cfgPath)
 	if e != nil {
 		log.Fatal(e)
 	}
-	a := &App{config: c, slots: make(chan struct{}, 4)}
+	if e := os.MkdirAll(c.jobDir, 0700); e != nil {
+		log.Fatal("Cannot create local job directory")
+	}
+	a := &App{config: c, slots: make(chan struct{}, 4), panel: NewPanelClient(c.MinekuaiAPIKey, c.MinekuaiInstanceID)}
 	server := &http.Server{Addr: c.Listen, Handler: a.handler(), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 150 * time.Second, WriteTimeout: 180 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
 	listener, e := net.Listen("tcp", c.Listen)
 	if e != nil {
 		log.Fatalf("Cannot listen on %s: %v", c.Listen, e)
 	}
-	log.Printf("YSM Bridge listening on http://%s", listener.Addr())
+	log.Printf("YSM Upload listening on http://%s", listener.Addr())
 	if e := server.Serve(listener); e != nil && e != http.ErrServerClosed {
 		log.Fatal(e)
 	}

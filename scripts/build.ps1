@@ -1,4 +1,4 @@
-﻿$ErrorActionPreference = 'Stop'
+$ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path $PSScriptRoot -Parent
 Push-Location $projectRoot
 try {
@@ -14,6 +14,8 @@ try {
     try {
         go test ./...
         if ($LASTEXITCODE -ne 0) { throw 'Go tests failed' }
+        go vet ./...
+        if ($LASTEXITCODE -ne 0) { throw 'Go vet failed' }
         go build -trimpath -o ../dist/ysm-bridge.exe .
         if ($LASTEXITCODE -ne 0) { throw 'Go build failed' }
     } finally { Pop-Location }
